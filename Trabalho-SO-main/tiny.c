@@ -9,50 +9,22 @@
  */
 #include "csapp.h"
 
-void *producer(void *args)
+typedef struct //estrutura para armazenar os dados do cliente
 {
+  int req_number;
   int connfd;
-  int listenfd = *((int *)args);
-  struct sockaddr_in clientaddr;
-  int clientlen = sizeof(clientaddr);
+} request_policy_t;
 
-  while (1)
-  {
-    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+//inicialização de todas as variáveis globais
+short int policy_is_fifo = 0;
+int req_producer_index, req_consumer_index;
+int buffer_size, req_fifo_counter;
+request_policy_t *request_buffer;
 
-    // Escrever para o Buffer Circular de Tamnha N indicado por Buffer_Size
-  }
-}
-
-void *consumer(void *args)
-{
-  while (1)
-  {
-    // Leer do Buffer Circular de Tamnha N indicado por Buffer_Size
-    int connfd;
-    doit(connfd);
-    Close(connfd);
-  }
-}
-
-/*
-void *myThreadFun(void *vargp)
-{
-  int connfd;
-  int listenfd = *((int *)vargp);
-  struct sockaddr_in clientaddr;
-  int clientlen = sizeof(clientaddr);
-
-  // while (1)
-  // {
-  connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); // line:netp:tiny:accept
-  doit(connfd);                                             // line:netp:tiny:doit
-  Close(connfd);                                            // line:netp:tiny:close
-                                                            // }
-
-  // return NULL;
-  pthread_exit(NULL);
-}*/
+pthread_mutex_t mutex_buffer;
+pthread_mutex_t mutex_fifo;
+pthread_cond_t cond_producer;
+pthread_cond_t cond_consumer;
 
 void doit(int fd);
 void read_requesthdrs(rio_t *rp);
@@ -62,17 +34,20 @@ void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 
+void *request_consumer(void *args);
+
 int numeroRequestStat = 0;
 
 int main(int argc, char **argv)
 {
-  int listenfd, connfd, port, threads_number, buffer_size;
+  int listenfd, connfd, port, threads_number, request_counter;
   unsigned int clientlen; // change to unsigned as sizeof returns unsigned
+  char *policy;
   struct sockaddr_in clientaddr;
   pthread_t *threads;
 
   /* Check command line args */
-  if (argc != 4)
+  if (argc != 5)
   {
     fprintf(stderr, "usage: %s <port> <threads> <buffers> <schedalg>\n", argv[0]);
     exit(1);
@@ -80,6 +55,7 @@ int main(int argc, char **argv)
   port = atoi(argv[1]);
   threads_number = atoi(argv[2]);
   buffer_size = atoi(argv[3]);
+  policy = argv[4];
 
   if (port < MIN_PORT_NUMBER)
   {
@@ -87,26 +63,57 @@ int main(int argc, char **argv)
     exit(1);
   }
 
-  // SERVER INIT
-  fprintf(stderr, "Server : %s Running on  <%d>\n", argv[0], port);
-  listenfd = Open_listenfd(port);
+  printf("port: %d\n", port);
+  printf("threads: %d\n", threads_number);
+  printf("buffers: %d\n", buffer_size);
+  printf("policy: %s\n", policy);
 
-  // THREADS INIT
-  threads = (pthread_t *)malloc(sizeof(pthread_t) * threads_number);
+  // ===== RESOURCES ALLOCATION =====
+  // POLICY
+  policy_is_fifo = strcmp(policy, "FIFO") == 0;
+  request_counter = 0;
+  req_fifo_counter = 0;
+  // Buffer
+  req_producer_index = 0;
+  req_consumer_index = 0;
+  request_buffer = (request_policy_t *)malloc(sizeof(request_policy_t) * buffer_size);
 
-  // Threads creation
-  // Create Producer Thread
-  int ret = pthread_create(&threads[0], NULL, producer, (void *)&listenfd);
-  if (ret)
+  // Mutex
+  if (pthread_mutex_init(&mutex_buffer, NULL) != 0)
   {
-    fprintf(stderr, "Error creating producer thread\n");
+    fprintf(stderr, "Error initializing mutex\n");
+    exit(-1);
+  }
+  if (pthread_mutex_init(&mutex_fifo, NULL) != 0)
+  {
+    fprintf(stderr, "Error initializing mutex\n");
     exit(-1);
   }
 
-  // Create Consumer Threads
-  for (int i = 1; i < threads_number; i++)
+  // Conditional Variables
+  if (pthread_cond_init(&cond_producer, NULL) != 0)
   {
-    int ret = pthread_create(&threads[i], NULL, consumer, (void *)&listenfd);
+    fprintf(stderr, "Error initializing conditional variable cond_producer\n");
+    exit(-1);
+  }
+  if (pthread_cond_init(&cond_consumer, NULL) != 0)
+  {
+    fprintf(stderr, "Error initializing conditional variable cond_consumer\n");
+    exit(-1);
+  }
+
+  // Threads
+  threads = (pthread_t *)malloc(sizeof(pthread_t) * threads_number);
+
+  // ===== SERVER INIT ===== //
+  fprintf(stderr, "Server : %s Running on  <%d>\n", argv[0], port);
+  listenfd = Open_listenfd(port);
+
+  // Criação das threads
+  // Criação das threads consumidor
+  for (int i = 0; i < threads_number; i++)
+  {
+    int ret = pthread_create(&threads[i], NULL, request_consumer, NULL);
     if (ret)
     {
       fprintf(stderr, "Error creating consumer threads\n");
@@ -114,17 +121,92 @@ int main(int argc, char **argv)
     }
   }
 
-  // Wait for all threads to complete
-  for (int i = 0; i < threads_number; i++)
+  // Aceitação das conexões http  alocação do descritor na buffer
+  clientlen = sizeof(clientaddr);
+  while (TRUE)
   {
-    pthread_join(threads[i], NULL);
+    request_policy_t req;
+
+    req.req_number = request_counter;
+    req.connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+
+    request_counter++;
+
+    // Escrever para o Buffer Circular de tamanho N indicado por Buffer_Size
+    pthread_mutex_lock(&mutex_buffer);
+
+    // Secção crítica 
+    while ((req_producer_index + 1) % buffer_size == req_consumer_index)
+    {
+      pthread_cond_wait(&cond_consumer, &mutex_buffer);
+    }
+    request_buffer[req_producer_index] = req;
+    req_producer_index = ++req_producer_index % buffer_size;
+    pthread_cond_signal(&cond_producer);
+    pthread_mutex_unlock(&mutex_buffer);
   }
 
+  // Desalocação e finalização de todos os recursos
+  pthread_mutex_destroy(&mutex_buffer);
+  pthread_mutex_destroy(&mutex_fifo);
+  pthread_cond_destroy(&cond_producer);
+  pthread_cond_destroy(&cond_consumer);
+  free(request_buffer);
   free(threads);
+
   pthread_exit(NULL);
 }
 
-/* $end tinymain */
+void *request_consumer(void *args)
+{
+  request_policy_t req;
+
+  // Detach self
+  pthread_detach(pthread_self());
+
+  while (TRUE)
+  {
+    pthread_mutex_lock(&mutex_buffer);
+    while (req_producer_index == req_consumer_index)
+    {
+      pthread_cond_wait(&cond_producer, &mutex_buffer);
+    }
+    // Seccao critica do consumidor
+    // Leer do Buffer Circular de Tamnha N indicado por Buffer_Size
+    req = request_buffer[req_consumer_index];
+    req_consumer_index = ++req_consumer_index % buffer_size;
+
+    pthread_mutex_unlock(&mutex_buffer);
+    pthread_cond_signal(&cond_consumer);
+
+    // Verifica a política FIFO
+    if (policy_is_fifo)
+    {
+      while (TRUE)
+      {
+        pthread_mutex_lock(&mutex_fifo);
+        if (req.req_number == req_fifo_counter)
+        {
+          printf("STATISTIC - REQUEST NUMBER %d\n", req.req_number);
+          doit(req.connfd);
+          Close(req.connfd);
+          req_fifo_counter++;
+          pthread_mutex_unlock(&mutex_fifo);
+          break;
+        }
+        pthread_mutex_unlock(&mutex_fifo);
+      }
+    }
+    else
+    {
+      printf("STATISTIC - REQUEST NUMBER: %d\n", req.req_number);
+      doit(req.connfd);
+      Close(req.connfd);
+    }
+  }
+
+  pthread_exit(NULL);
+}
 
 /*
  * doit - handle one HTTP request/response transaction
@@ -256,8 +338,12 @@ void serve_static(int fd, char *filename, int filesize)
   srcfd = Open(filename, O_RDONLY, 0);                        // line:netp:servestatic:open
   srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0); // line:netp:servestatic:mmap
   Close(srcfd);                                               // line:netp:servestatic:close
-  Rio_writen(fd, srcp, filesize);                             // line:netp:servestatic:write
-  Munmap(srcp, filesize);                                     // line:netp:servestatic:munmap
+
+  // printf("HEADER\n%s\n", buf);
+  // printf("RESPONSE\n%s\n", srcp);
+
+  Rio_writen(fd, srcp, filesize); // line:netp:servestatic:write
+  Munmap(srcp, filesize);         // line:netp:servestatic:munmap
 }
 
 /*
